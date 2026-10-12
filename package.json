@@ -1,0 +1,39 @@
+{
+  "name": "microshop",
+  "version": "1.0.0",
+  "private": true,
+  "description": "MicroShop : application Next.js + 2 microservices Express servant de banc d'essai à l'extraction documentaire d'Auto-Doc.",
+  "type": "module",
+  "workspaces": [
+    "services/users-service",
+    "services/orders-service",
+    "apps/web"
+  ],
+  "engines": {
+    "node": ">=20.9.0"
+  },
+  "scripts": {
+    "dev": "concurrently -k -n users,orders,web -c blue,magenta,green \"npm:dev:users\" \"npm:dev:orders\" \"npm:dev:web\"",
+    "dev:users": "npm run dev -w services/users-service",
+    "dev:orders": "npm run dev -w services/orders-service",
+    "dev:web": "npm run dev -w apps/web",
+    "build": "npm run build --workspaces",
+    "start": "concurrently -k -n users,orders,web -c blue,magenta,green \"npm run start -w services/users-service\" \"npm run start -w services/orders-service\" \"npm run start -w apps/web\"",
+    "typecheck": "npm run typecheck --workspaces && tsc -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^20.19.43",
+    "@types/supertest": "^7.2.1",
+    "concurrently": "^9.2.1",
+    "express": "^5.3.0",
+    "supertest": "^7.3.1",
+    "typescript": "~5.9.3",
+    "vitest": "^4.1.11"
+  },
+  "overrides": {
+    "vite": "^6.4.4"
+  }
+}
