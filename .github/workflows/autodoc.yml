@@ -1,0 +1,250 @@
+# Auto-Doc — documentation continue
+#
+# Installation : copiez ce fichier dans .github/workflows/autodoc.yml du dépôt connecté
+# à Auto-Doc, puis créez les secrets du dépôt (Settings → Secrets and variables → Actions) :
+#   AUTODOC_API_URL     URL publique HTTPS du backend Auto-Doc (sans /api à la fin)
+#   AUTODOC_PROJECT_ID  identifiant du projet dans Auto-Doc
+#   AUTODOC_API_KEY     clé CI/CD du projet (affichée une seule fois par Auto-Doc)
+#
+# Ce workflow ne récupère ni n'exécute le code du dépôt : il notifie Auto-Doc, qui
+# analyse lui-même le commit poussé, génère la documentation et la soumet à revue.
+# Il fonctionne quel que soit le langage du projet.
+
+name: Auto-Doc
+
+on:
+  push:
+    branches:
+      - "main"
+  workflow_dispatch:
+
+# Aucun droit n'est nécessaire sur le dépôt : seul l'appel HTTPS vers Auto-Doc est effectué.
+permissions: {}
+
+# Les commits d'une même branche sont documentés l'un après l'autre, aucun n'est annulé.
+concurrency:
+  group: autodoc-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  autodoc:
+    name: Documenter le commit avec Auto-Doc
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      AUTODOC_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+      AUTODOC_REPOSITORY: ${{ github.repository }}
+      AUTODOC_BRANCH: ${{ github.ref_name }}
+      AUTODOC_COMMIT_SHA: ${{ github.sha }}
+      AUTODOC_EVENT: ${{ github.event_name }}
+      AUTODOC_ACTOR: ${{ github.actor }}
+      AUTODOC_WORKFLOW: ${{ github.workflow }}
+      AUTODOC_RUN_NUMBER: ${{ github.run_number }}
+      AUTODOC_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+      AUTODOC_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+      AUTODOC_COMMIT_AUTHOR: ${{ github.event.head_commit.author.name }}
+
+    steps:
+      - name: Vérifier la configuration Auto-Doc
+        shell: bash
+        env:
+          RAW_API_URL: ${{ secrets.AUTODOC_API_URL }}
+          RAW_PROJECT_ID: ${{ secrets.AUTODOC_PROJECT_ID }}
+          RAW_API_KEY: ${{ secrets.AUTODOC_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          trim() { printf '%s' "$1" | tr -d '\r\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+
+          API_URL="$(trim "$RAW_API_URL")"
+          PROJECT_ID="$(trim "$RAW_PROJECT_ID")"
+          API_KEY="$(trim "$RAW_API_KEY")"
+          missing=""
+          [ -n "$API_URL" ] || missing="$missing AUTODOC_API_URL"
+          [ -n "$PROJECT_ID" ] || missing="$missing AUTODOC_PROJECT_ID"
+          [ -n "$API_KEY" ] || missing="$missing AUTODOC_API_KEY"
+          if [ -n "$missing" ]; then
+            echo "::error::Secrets Auto-Doc manquants :$missing (Settings → Secrets and variables → Actions)."
+            exit 1
+          fi
+
+          # The trimmed values may differ from the raw secrets: mask them too.
+          echo "::add-mask::$API_KEY"
+          echo "::add-mask::$PROJECT_ID"
+
+          API_URL="${API_URL%/}"
+          case "$API_URL" in
+            https://*) ;;
+            *) echo "::error::AUTODOC_API_URL doit être une URL HTTPS publique (tunnel ou serveur)."; exit 1 ;;
+          esac
+          if ! printf '%s' "$PROJECT_ID" | grep -Eq '^[A-Za-z0-9-]{8,64}$'; then
+            echo "::error::AUTODOC_PROJECT_ID n'a pas le format d'un identifiant de projet Auto-Doc."
+            exit 1
+          fi
+
+          {
+            echo "AUTODOC_API_URL=$API_URL"
+            echo "AUTODOC_PROJECT_ID=$PROJECT_ID"
+            echo "AUTODOC_API_KEY=$API_KEY"
+          } >> "$GITHUB_ENV"
+          echo "Configuration Auto-Doc présente (hôte : $(printf '%s' "$API_URL" | sed -E 's#^https://([^/]+).*#\1#'))."
+
+      - name: Déclencher Auto-Doc et attendre la documentation
+        id: autodoc
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BASE="${AUTODOC_API_URL}/api/v1/projects/${AUTODOC_PROJECT_ID}"
+          RUN_STARTED=0
+          CANCELLED=0
+          PHASE="extract"
+
+          # Every call is bounded; the Authorization header is never sent to another host (no -L).
+          api() {
+            local method="$1" path="$2" body="${3:-}"
+            local args=(-sS -o response.json -w '%{http_code}' -X "$method"
+              --connect-timeout 10 --max-time 60
+              -H "Authorization: Bearer ${AUTODOC_API_KEY}"
+              -H "Accept: application/json"
+              -H "ngrok-skip-browser-warning: true")
+            if [ -n "$body" ]; then args+=(-H "Content-Type: application/json" --data-binary "$body"); fi
+            rm -f response.json
+            HTTP_STATUS="$(curl "${args[@]}" "${BASE}${path}")" || HTTP_STATUS="000"
+          }
+
+          field() {
+            python3 - "$1" <<'PY'
+          import json, sys
+          try:
+              value = json.load(open("response.json", encoding="utf-8"))
+          except Exception:
+              print(""); sys.exit(0)
+          for part in [p for p in sys.argv[1].split(".") if p]:
+              value = value.get(part) if isinstance(value, dict) else None
+          print("" if value is None else value)
+          PY
+          }
+
+          show_error() {
+            echo "::error::Auto-Doc $1 : HTTP ${HTTP_STATUS} $(field error) $(field message)"
+          }
+
+          payload() {
+            python3 - "$@" <<'PY'
+          import json, os, sys
+          data = {
+              "trigger": "github_actions",
+              "triggerType": "github_actions",
+              "repository": os.environ["AUTODOC_REPOSITORY"],
+              "branch": os.environ["AUTODOC_BRANCH"],
+              "commitSha": os.environ["AUTODOC_COMMIT_SHA"],
+              "commitMessage": os.environ.get("AUTODOC_COMMIT_MESSAGE", "")[:500],
+              "commitAuthor": os.environ.get("AUTODOC_COMMIT_AUTHOR", ""),
+              "actor": os.environ["AUTODOC_ACTOR"],
+              "workflow": os.environ["AUTODOC_WORKFLOW"],
+              "workflowRunId": os.environ["AUTODOC_RUN_ID"],
+              "workflowRunNumber": os.environ["AUTODOC_RUN_NUMBER"],
+              "workflowUrl": os.environ["AUTODOC_RUN_URL"],
+              "eventName": os.environ["AUTODOC_EVENT"],
+              "async": True,
+          }
+          for pair in sys.argv[1:]:
+              key, _, value = pair.partition("=")
+              data[key] = value
+          print(json.dumps(data))
+          PY
+          }
+
+          # A failure after Auto-Doc recorded the run is reported once; a cancellation is
+          # reported by the next step instead, never as a failure.
+          on_signal() { CANCELLED=1; exit 130; }
+          trap on_signal INT TERM
+          report_failure() {
+            local code=$?
+            if [ "$code" -eq 0 ] || [ "$RUN_STARTED" != "1" ] || [ "$CANCELLED" = "1" ]; then exit "$code"; fi
+            api POST "/cicd/failure" "$(payload "phase=$PHASE" "errorMessage=GitHub Actions s'est arrêté pendant la phase $PHASE (code $code).")" || true
+            echo "Échec signalé à Auto-Doc (HTTP ${HTTP_STATUS})."
+            exit "$code"
+          }
+          trap report_failure EXIT
+
+          # Waits for the run, tolerating short network interruptions (tunnel restart).
+          wait_for() {
+            local target="$1" max_attempts="$2" network_failures=0
+            for attempt in $(seq 1 "$max_attempts"); do
+              api GET "/cicd/runs/${CICD_RUN_ID}/status"
+              if [ "$HTTP_STATUS" = "000" ] || [ "${HTTP_STATUS:0:1}" = "5" ]; then
+                network_failures=$((network_failures + 1))
+                if [ "$network_failures" -ge 12 ]; then show_error "injoignable"; exit 1; fi
+                sleep 5; continue
+              fi
+              network_failures=0
+              if [ "$HTTP_STATUS" != "200" ]; then show_error "statut"; exit 1; fi
+
+              run_status="$(field status)"
+              extraction_status="$(field extraction.status)"
+              documentation_status="$(field documentation.status)"
+              if [ "$(field commitSha)" != "$AUTODOC_COMMIT_SHA" ]; then echo "::error::Auto-Doc suit un autre commit."; exit 1; fi
+
+              case "$run_status" in
+                failed|cancelled)
+                  echo "::error::Auto-Doc : exécution ${run_status} — $(field errorMessage)"
+                  exit 1 ;;
+              esac
+
+              if [ "$target" = "extraction" ] && [ "$extraction_status" = "completed" ]; then
+                echo "Extraction terminée."
+                return 0
+              fi
+              if [ "$target" = "documentation" ] && [ "$run_status" = "success" ]; then
+                echo "Documentation générée : statut ${documentation_status} (version $(field documentation.documentationVersionId))."
+                return 0
+              fi
+
+              echo "En cours (${attempt}/${max_attempts}) : extraction ${extraction_status:-?}, documentation ${documentation_status:-?}."
+              sleep 5
+            done
+            echo "::error::Auto-Doc n'a pas terminé la phase ${target} dans le délai imparti."
+            exit 1
+          }
+
+          PHASE="extract"
+          api POST "/extract" "$(payload)"
+          case "$HTTP_STATUS" in
+            202) ;;
+            000) echo "::error::Auto-Doc est injoignable (backend arrêté ou tunnel inactif)."; exit 1 ;;
+            *) show_error "extraction"; exit 1 ;;
+          esac
+          CICD_RUN_ID="$(field cicdRunId)"
+          if [ -z "$CICD_RUN_ID" ]; then echo "::error::Réponse Auto-Doc sans identifiant d'exécution."; exit 1; fi
+          RUN_STARTED=1
+          echo "Exécution Auto-Doc enregistrée : ${CICD_RUN_ID} (commit ${AUTODOC_COMMIT_SHA:0:7}, branche ${AUTODOC_BRANCH})."
+
+          # Up to 30 min: the analysis may wait for a previous commit of the project.
+          PHASE="poll_extraction"
+          wait_for extraction 360
+
+          PHASE="generate"
+          api POST "/generate" "$(payload "generationMode=technical_documentation" "language=fr")"
+          case "$HTTP_STATUS" in
+            200|202) ;;
+            *) show_error "génération"; exit 1 ;;
+          esac
+
+          PHASE="poll_documentation"
+          wait_for documentation 300
+
+          echo "Documentation soumise à revue dans Auto-Doc ; elle n'est ni validée ni publiée automatiquement."
+
+      - name: Signaler l'annulation à Auto-Doc
+        if: cancelled() && env.AUTODOC_API_URL != ''
+        shell: bash
+        run: |
+          body="$(python3 -c 'import json, os; print(json.dumps({"trigger": "github_actions", "triggerType": "github_actions", "repository": os.environ["AUTODOC_REPOSITORY"], "branch": os.environ["AUTODOC_BRANCH"], "commitSha": os.environ["AUTODOC_COMMIT_SHA"], "workflowRunId": os.environ["AUTODOC_RUN_ID"], "outcome": "cancelled", "errorMessage": "Workflow GitHub Actions annulé."}))')"
+          curl -sS -o /dev/null -w 'Annulation signalée (HTTP %{http_code}).\n' --connect-timeout 10 --max-time 30 \
+            -X POST "${AUTODOC_API_URL}/api/v1/projects/${AUTODOC_PROJECT_ID}/cicd/failure" \
+            -H "Authorization: Bearer ${AUTODOC_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -H "ngrok-skip-browser-warning: true" \
+            --data-binary "$body" || true
